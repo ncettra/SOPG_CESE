@@ -1,8 +1,39 @@
+/*TODO:
+	
+	Correcciones TP2:
+
+	1) controlar error en : pthread_create, socket
+		-listo, linea 46 verifico el retorno de pthread_create 
+
+	2) antes de lanzar el thread, tenes que bloquear las signals, para asegurarte de que las signals lleguen siempre al hilo ppal. (fijate que se vio en la clase 6)
+		-listo, linea 44 y 54, se colocaron 2 funciones, una es para bloquear señal y otra para desbloquear
+
+	3) en el thread, cuando recibis por el puerto serie y antes de hacer el envio por el socket, tenes que comprobar que haya una conexion establecida sino puede ser que hagas un write con un "fd" invalido. Usa el flag isConnected para hacer este chequeo
+		-listo, para ello isConnected se hizo global (linea 23) y posteriormente fue anidada en la condicion de lectura en thread_serial_handler(), linea 173
+	
+	4) como este flag isConnected lo vas a leer desde un thread y escribir desde otro, podes usar un mutex para proteger el acceso a esta variable.
+		-listo, el mutex fue agregado en cada escritura de isConnected, pero considero que no era necesario, dado que en thread era solo para lectura.
+	
+	5) la deteccion de error en el read o en el accept (que pasa cuando recibis la signal), deberian generar que se salga del loop ppal (no hacer un exit ahi nomas) y que salgas del proceso retornando por el main, alli, antes de salir, podes hacer el cierre de todos los recursos que tenes abiertos antes de terminar, incluyendo la llamada  a pthread_cancel y el join para esperar a que termine y el cierre de los sockets abiertos
+		-listo, se aplico cancel, join y close del fd, lineas 114 y 135
+
+	6) no se puede usar printf en el handler
+		-listo, esta aplicado inecesariamente (si se quisiera imprimir se entiende que es con el write)
+
+	7) la variable running tenia que ser del tipo volatile sig_atomic_t (ver este tema en clase 3)
+		-listo, linea 31
+
+	8) en serial_send no envies todo el buffer, envia solo la cantidad que recibiste, lo mismo cuando envias por el socket.
+		-listo, se utilizo la funcion strlen para contar los caracteres en ambos casos 
+*/
+
+
 #include "main.h"
 
 //Señales
 struct sigaction sa1, sa2;
-static bool running = true; //me permite las detenciones con las señales
+volatile sig_atomic_t running = true; //me permite las detenciones con las señales
+bool isConnected = false; //esta conectado (TCP)
 static uint8_t fd; //file descriptor tcp
 // Buffer del puerto serial
 static char rxSerialBuffer [SERIAL_BUFFER_LENGTH_];
@@ -20,16 +51,29 @@ int main(void)
 {
 	signal_init();
 
+	//creo el mutex
+	pthread_mutex_t mutexSem; //Igual tengo la duda de proteger isConnected, porque si bien es un recurso compartido, el thread lo usa solo para lectura
+
+	//bloqueo las signals:
+	block_signals();
+
 	// Creamos la task de comunicacion serial
-	pthread_t threadSerial = pthread_create(&threadSerial, NULL, thread_serial_handler, NULL);	
+	pthread_t threadSerial;
+	if( pthread_create(&threadSerial, NULL, thread_serial_handler, NULL)!=0)	
+	{
+		perror(" (x) Thread error!"); 
+	}
 	
+	//desbloqueo la signals
+	unblock_signals();
+
 	// TCP IP socket server implementation
 	socklen_t addr_len;
 	struct sockaddr_in clientaddr;
 	struct sockaddr_in serveraddr;
 
 	int tcp_rx_bytes; //cant de bytes recibidos (TCP)
-	bool isConnected = false; //esta conectado (TCP)
+	
 
 	// Creamos el socket  (1)
 	int socket_tcp = socket(AF_INET,SOCK_STREAM, 0); // 0 = TCP ; 1 = UDP 
@@ -38,6 +82,7 @@ int main(void)
 	if (setsockopt(socket_tcp, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int)) < 0)
     {
 		perror(" (x) Set socket error!"); 
+		return 1;
 	}
 	bzero((char*) &serveraddr, sizeof(serveraddr));
 	serveraddr.sin_port = htons(port);
@@ -73,12 +118,19 @@ int main(void)
 	 	if ( (fd = accept(socket_tcp, (struct sockaddr *)&clientaddr,&addr_len)) < 0 )
 		{
 			perror(" (x) Accept error!\r\n");
-			exit(1);
+			//exit(1);
+			pthread_cancel(threadSerial);
+			pthread_join(threadSerial, NULL);
+			close(fd);
 		}	
 		char ipClient[32];
 		inet_ntop(serveraddr.sin_family , &(clientaddr.sin_addr), ipClient, sizeof(ipClient));
 		printf  ("Server ---> Conexion con %s\n",ipClient);
-		isConnected = true;	
+
+		pthread_mutex_lock(&mutexSem);
+		isConnected = true;
+		pthread_mutex_unlock(&mutexSem);
+
 		// send/recv   ------> Server(send/recv)	(6)
 		while(isConnected)
 		{	
@@ -87,19 +139,25 @@ int main(void)
 				if(running)
 				{
 					perror("(x) Read error!\r\n");
-					exit(1);
+					//exit(1);
+
+					pthread_cancel(threadSerial);
+					pthread_join(threadSerial, NULL);
+					close(fd);
 				}
 				break;
 			}
 			else if(tcp_rx_bytes == 0)
 			{
+				pthread_mutex_lock(&mutexSem);
 				isConnected = false;
+				pthread_mutex_unlock(&mutexSem);
 			}
 			else
 			{
 				rxSerialBuffer[tcp_rx_bytes]=0x00;
 				printf("Recibido: %s\n",rxSerialBuffer);
-				serial_send(rxSerialBuffer, SERIAL_BUFFER_LENGTH_);
+				serial_send(rxSerialBuffer, strlen(rxSerialBuffer));
 			}			
 		}
 		if(running)
@@ -126,23 +184,24 @@ static void* thread_serial_handler()
 
 	while(running) //no me conviene el while true sino no voy a poder cerrar el puerto....
 	{
-		if( bytes_rx = serial_receive(rxSerialBuffer, SERIAL_BUFFER_LENGTH_) > 0)
+		if( bytes_rx = serial_receive(rxSerialBuffer, SERIAL_BUFFER_LENGTH_) > 0 && isConnected)
 		{
-			write(fd, rxSerialBuffer, sizeof(rxSerialBuffer));
+			write(fd, rxSerialBuffer, strlen(rxSerialBuffer));
 		}	
 		usleep(1000); //Esto es para que no quede la cpu al 100%
 	}
-	
-	printf("Cerrando puerto serial\r\n");
+
 	serial_close();
 }
+/* Señales */
 static void signal_init()
 {
     sa1.sa_handler = signal_handler;
     sa1.sa_flags = 0;
     sigemptyset(&sa1.sa_mask);
     
-    if(sigaction(SIGINT, &sa1, NULL) < 0){
+    if(sigaction(SIGINT, &sa1, NULL) < 0)
+	{
         perror(" (x) Error al crear señal");
         exit(1);
     }
@@ -151,10 +210,27 @@ static void signal_init()
     sa2.sa_flags = 0;
     sigemptyset(&sa2.sa_mask);
 
-    if(sigaction(SIGTERM, &sa2, NULL) < 0){
+    if(sigaction(SIGTERM, &sa2, NULL) < 0)
+	{
         perror(" (x) Error al crear señal");
         exit(1);
     }
+}
+static void block_signals()
+{
+	sigset_t set;
+	sigemptyset(&set);
+	sigaddset(&set, SIGINT);
+	sigaddset(&set, SIGTERM);
+	pthread_sigmask(SIG_BLOCK, &set, NULL);
+}
+static void unblock_signals()
+{
+	sigset_t set;
+	sigemptyset(&set);
+	sigaddset(&set, SIGINT);
+	sigaddset(&set, SIGTERM);
+	pthread_sigmask(SIG_UNBLOCK, &set, NULL);
 }
 static void signal_handler(int signal)
 {
